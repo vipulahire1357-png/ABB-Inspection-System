@@ -1,0 +1,5 @@
+google-genai
+pydantic>=2.0
+Pillow
+pandas
+python-dotenv
