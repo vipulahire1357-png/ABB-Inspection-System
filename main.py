@@ -1,11 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-ABB PanelSight - Local VS Code version
-Gemini vision extraction + local crop/coordinate conversion/annotation/JSON export.
+ABB PanelSight - Local VS Code version (Abby API edition)
+Abby (ABB internal AI gateway) vision extraction + local crop/coordinate
+conversion/annotation/JSON export.
 """
 
 import asyncio
 import argparse
+import base64
 import io
 import json
 import os
@@ -15,54 +17,85 @@ import time
 from pathlib import Path
 from typing import Literal
 
+import httpx
 import pandas as pd
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 from pydantic import create_model
 from dotenv import load_dotenv
-from google import genai
-from google.genai import types
 from tkinter import Tk, filedialog
 
 # ============================================================
-# 1. CONFIGURATION
+# 1. CONFIGURATION (all values come from .env)
 # ============================================================
 
-# Find the existing .env file in this project folder or any parent folder.
 BASE_DIR = Path(__file__).resolve().parent
+
+# Find the existing .env file in this project folder or any parent folder.
 ENV_FILE = next(
-    (folder / ".env")
-    for folder in (BASE_DIR, *BASE_DIR.parents)
-    if (folder / ".env").is_file()
+    (folder / ".env"
+     for folder in (BASE_DIR, *BASE_DIR.parents)
+     if (folder / ".env").is_file()),
+    None,
 )
+if ENV_FILE is None:
+    raise RuntimeError(f"No .env file found in {BASE_DIR} or any parent folder.")
 
 load_dotenv(dotenv_path=ENV_FILE, override=False)
 
-API_KEY = (
-    os.getenv("GEMINI_API_KEY")
-    or os.getenv("GOOGLE_API_KEY")
-    or ""
-).strip()
 
+def env_str(key, default=""):
+    return (os.getenv(key) or default).strip()
+
+
+def env_int(key, default):
+    try:
+        return int(env_str(key, str(default)))
+    except ValueError:
+        return default
+
+
+def env_float(key, default):
+    try:
+        return float(env_str(key, str(default)))
+    except ValueError:
+        return default
+
+
+def env_bool(key, default):
+    value = env_str(key, str(default)).lower()
+    return value in {"1", "true", "yes", "on"}
+
+
+API_KEY = env_str("ABBY_API_KEY")
 if not API_KEY:
-    raise RuntimeError(
-        f"Gemini API key not found in {ENV_FILE}. "
-        "Expected GEMINI_API_KEY or GOOGLE_API_KEY."
-    )
+    raise RuntimeError(f"ABBY_API_KEY not found in {ENV_FILE}.")
 
-print(f"Gemini API key loaded successfully from: {ENV_FILE}")
+# Endpoint (check https://api.abby.abb.com/documentation/ for the exact path)
+ABBY_BASE_URL = env_str("ABBY_BASE_URL", "https://api.abby.abb.com").rstrip("/")
+ABBY_CHAT_PATH = "/" + env_str("ABBY_CHAT_PATH", "/api/v1/chat/completions").lstrip("/")
+ABBY_ENDPOINT = ABBY_BASE_URL + ABBY_CHAT_PATH
 
-MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
-THINKING_LEVEL = "minimal"
+# Authentication header, e.g. "Authorization" + "Bearer"  or  "x-api-key" + ""
+ABBY_AUTH_HEADER = env_str("ABBY_AUTH_HEADER", "Authorization")
+ABBY_AUTH_SCHEME = env_str("ABBY_AUTH_SCHEME", "Bearer")
 
-# Laptop-friendly defaults. Increase concurrency only if API quota allows.
-MAX_CONCURRENCY = 3
-MAX_RETRIES = 2
-MAX_OUTPUT_TOKENS = 2048
-MAX_LONG_SIDE = 2048
-JPEG_QUALITY = 90
-MEDIA_RESOLUTION = types.MediaResolution.MEDIA_RESOLUTION_MEDIUM
+MODEL = env_str("ABBY_MODEL", "gemini-3.8-flash")
 
-USE_STREAM = True
+# Performance / request tuning
+MAX_CONCURRENCY = env_int("ABBY_MAX_CONCURRENCY", 3)
+MAX_RETRIES = env_int("ABBY_MAX_RETRIES", 3)
+MAX_OUTPUT_TOKENS = env_int("ABBY_MAX_OUTPUT_TOKENS", 4096)
+TEMPERATURE = env_float("ABBY_TEMPERATURE", 0.0)
+REQUEST_TIMEOUT_S = env_float("ABBY_TIMEOUT_S", 120.0)
+USE_JSON_MODE = env_bool("ABBY_JSON_MODE", True)     # sends response_format=json_object
+VERIFY_SSL = env_bool("ABBY_VERIFY_SSL", True)        # set false only behind SSL-inspecting proxy
+
+# Image tuning (smaller = faster + cheaper, larger = better OCR on small labels)
+MAX_LONG_SIDE = env_int("MAX_LONG_SIDE", 2048)
+JPEG_QUALITY = env_int("JPEG_QUALITY", 88)
+IMAGE_DETAIL = env_str("ABBY_IMAGE_DETAIL", "high")  # high | low | auto
+IMAGE_FORMAT = env_str("ABBY_IMAGE_FORMAT", "abby_file")  # confirmed working; "auto" = re-detect
+
 NATIVE_YX = True
 
 OUTPUT_ROOT = BASE_DIR / "output"
@@ -70,7 +103,31 @@ OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
 
 IMAGE_LOAD_METRICS = {}
 
-client = genai.Client(api_key=API_KEY)
+
+def safe_write_text(path, text):
+    """Write text, recreating the folder if needed. Never crashes the run."""
+    try:
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        Path(path).write_text(text, encoding="utf-8")
+        return True
+    except OSError as exc:
+        print(f"[WARN] Could not write {path}: {exc}")
+        return False
+RETRYABLE_STATUS = {408, 409, 425, 429, 500, 502, 503, 504}
+
+print(f"Abby API key loaded from: {ENV_FILE}")
+print(f"Abby endpoint: {ABBY_ENDPOINT}")
+print(f"Image format: {IMAGE_FORMAT}")
+
+
+def auth_headers():
+    value = f"{ABBY_AUTH_SCHEME} {API_KEY}".strip() if ABBY_AUTH_SCHEME else API_KEY
+    return {
+        ABBY_AUTH_HEADER: value,
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+
 
 # ============================================================
 # 2. SELECT AND LOAD IMAGES
@@ -210,7 +267,7 @@ def select_rois(originals):
     ).pack(anchor="w")
     tk.Label(
         intro,
-        text="Choose an image, then drag over the panel area you want Gemini to inspect. "
+        text="Choose an image, then drag over the panel area you want Abby to inspect. "
              "You can use the full image or define a different crop for every image.",
         bg=BG, fg=MUTED, font=("Segoe UI", 10), wraplength=1050, justify="left"
     ).pack(anchor="w", pady=(4, 0))
@@ -566,7 +623,9 @@ SYSTEM_PROMPT = (
     "the ferrule. Boxes are [ymin,xmin,ymax,xmax] integers 0-1000 relative to this "
     "image. Use i='' if unreadable; never guess. Do not classify terminal numbers, "
     "wire marks, logos, or printed device labels as devices. No grouping, ordering, "
-    "description, or extra fields."
+    "description, or extra fields. Output exactly one JSON object of the form "
+    '{"detections":[{"k":"device","i":"","b":[ymin,xmin,ymax,xmax]}]} '
+    "with no markdown and no text outside the JSON."
 )
 
 
@@ -675,60 +734,298 @@ def to_image_detections(data, name, rect, originals):
 
 
 # ============================================================
-# 5. GEMINI API PROCESSING
+# 5. ABBY API PROCESSING
 # ============================================================
 
-def make_config():
-    return types.GenerateContentConfig(
-        system_instruction=SYSTEM_PROMPT,
-        response_mime_type="application/json",
-        response_schema=SCHEMA,
-        max_output_tokens=MAX_OUTPUT_TOKENS,
-        media_resolution=MEDIA_RESOLUTION,
-        thinking_config=types.ThinkingConfig(thinking_level=THINKING_LEVEL),
+JSON_MODE_STATE = {"enabled": True}
+IMAGE_FORMAT_STATE = {"name": IMAGE_FORMAT}
+MIME = "image/jpeg"
+FILENAME = "image.jpg"
+
+
+def _meta():
+    return {"mime_type": MIME, "media_type": MIME, "filename": FILENAME}
+
+
+def _part_variants():
+    """Image content-part shapes: name -> fn(b64, data_url) -> part dict."""
+    variants = {
+        # Most common public formats first
+        "openai_url": lambda b, u: {"type": "image_url", "image_url": {"url": u}},
+        "openai_file": lambda b, u: {"type": "file", "file": {"filename": FILENAME, "file_data": u}},
+        "anthropic": lambda b, u: {"type": "image", "source": {"type": "base64", "media_type": MIME, "data": b}},
+        "input_image": lambda b, u: {"type": "input_image", "image_url": u},
+        "input_file": lambda b, u: {"type": "input_file", "filename": FILENAME, "file_data": u},
+    }
+    types = ["file", "image", "input_file", "input_image", "image_url", "base64", "image_base64", "document"]
+    keys = ["data", "file_data", "base64", "content", "bytes", "url", "image_url"]
+    for t in types:
+        for k in keys:
+            for val in ("b64", "url"):
+                pick = (lambda b, u, val=val: b if val == "b64" else u)
+                variants[f"flat/{t}/{k}/{val}"] = (
+                    lambda b, u, t=t, k=k, pick=pick: {"type": t, k: pick(b, u), **_meta()})
+                variants[f"nested_type/{t}/{k}/{val}"] = (
+                    lambda b, u, t=t, k=k, pick=pick: {"type": t, t: {k: pick(b, u), **_meta()}})
+                variants[f"nested_file/{t}/{k}/{val}"] = (
+                    lambda b, u, t=t, k=k, pick=pick: {"type": t, "file": {k: pick(b, u), **_meta()}})
+    return variants
+
+
+PART_VARIANTS = _part_variants()
+# Confirmed on api.abby.abb.com (2026-11-06): file part with raw base64 in "url".
+PART_VARIANTS["abby_file"] = lambda b, u: {
+    "type": "file", "url": b, "mime_type": MIME, "media_type": MIME, "filename": FILENAME,
+}
+
+# Attachments outside the content list (top-level or message-level fields)
+ATTACH_VARIANTS = {}
+for _where in ("top", "message"):
+    for _field in ("files", "attachments", "images", "documents"):
+        for _shape in ("obj_b64", "obj_url", "raw_b64", "raw_url"):
+            ATTACH_VARIANTS[f"{_where}/{_field}/{_shape}"] = (_where, _field, _shape)
+
+
+def _attachment(shape, b64, url):
+    if shape == "raw_b64":
+        return b64
+    if shape == "raw_url":
+        return url
+    return {"data": b64 if shape == "obj_b64" else url, "content": b64, "base64": b64, **_meta()}
+
+
+IMAGE_FORMATS = ["abby_file"] + [f for f in PART_VARIANTS if f != "abby_file"] + list(ATTACH_VARIANTS)
+
+
+def build_payload(image_b64, fmt=None, prompt="Inspect this panel image and return the JSON.",
+                  system=True, json_mode=None, model=None):
+    fmt = fmt or IMAGE_FORMAT_STATE["name"]
+    data_url = f"data:{MIME};base64,{image_b64}"
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}] if system else []
+    payload = {"model": model or MODEL, "temperature": TEMPERATURE, "max_tokens": MAX_OUTPUT_TOKENS}
+
+    if fmt in PART_VARIANTS:
+        user = {"role": "user", "content": [
+            {"type": "text", "text": prompt}, PART_VARIANTS[fmt](image_b64, data_url)]}
+    elif fmt in ATTACH_VARIANTS:
+        where, field, shape = ATTACH_VARIANTS[fmt]
+        user = {"role": "user", "content": prompt}
+        item = [_attachment(shape, image_b64, data_url)]
+        if where == "top":
+            payload[field] = item
+        else:
+            user[field] = item
+    else:
+        raise ValueError(f"Unknown ABBY_IMAGE_FORMAT: {fmt}")
+
+    messages.append(user)
+    payload["messages"] = messages
+    use_json = (USE_JSON_MODE and JSON_MODE_STATE["enabled"]) if json_mode is None else json_mode
+    if use_json:
+        payload["response_format"] = {"type": "json_object"}
+    return payload
+
+
+def error_message(response):
+    """Readable error text (ignores Abby's misleading 'param' field)."""
+    try:
+        data = response.json()
+    except Exception:
+        return response.text
+    err = data.get("error") or data.get("detail") or data
+    if isinstance(err, dict):
+        return " ".join(f"{err.get('message', '')} {err.get('details', '')}".split())
+    return " ".join(str(err).split())
+
+
+def _probe_image_b64():
+    probe = Image.new("RGB", (360, 140), "white")
+    ImageDraw.Draw(probe).text((30, 40), "X7Q", fill="black", font=get_font(64))
+    buf = io.BytesIO()
+    probe.save(buf, format="JPEG", quality=95)
+    return base64.b64encode(buf.getvalue()).decode("ascii")
+
+
+async def detect_image_format(http):
+    """Find the image format Abby accepts AND passes to the model. Logs everything."""
+    log_path = OUTPUT_ROOT / "abby_image_probe.log"
+    log_lines = []
+
+    def log(line):
+        print(line)
+        log_lines.append(line)
+
+    b64 = _probe_image_b64()
+    question = "What text is written in this image? Reply with the text only."
+
+    async def post(payload):
+        try:
+            r = await http.post(ABBY_ENDPOINT, json=payload)
+        except Exception as exc:
+            return None, f"ERR {type(exc).__name__}: {exc}"
+        if r.status_code != 200:
+            return r.status_code, error_message(r)[:160]
+        return 200, (extract_text(r.json()) or "").strip()[:80]
+
+    log(f"Detecting Abby image format for model {MODEL} (one-time check)...")
+
+    # Baselines: tells us whether list-style content is accepted at all
+    for name, content in (("text as string", "Reply OK"),
+                          ("text as list", [{"type": "text", "text": "Reply OK"}])):
+        status, info = await post({"model": MODEL, "max_tokens": 10,
+                                   "messages": [{"role": "user", "content": content}]})
+        log(f"  baseline {name:15} -> {status}: {info}")
+
+    async def try_fmt(fmt, model=None):
+        payload = build_payload(b64, fmt=fmt, prompt=question, system=False,
+                                json_mode=False, model=model)
+        status, info = await post(payload)
+        seen = status == 200 and "X7Q" in info.upper().replace(" ", "")
+        return fmt, status, info, seen
+
+    found = None
+    batch = 6
+    for i in range(0, len(IMAGE_FORMATS), batch):
+        results = await asyncio.gather(*[try_fmt(f) for f in IMAGE_FORMATS[i:i + batch]])
+        for fmt, status, info, seen in results:
+            if status != 400 or "FileInputBase64Content" not in info:
+                log(f"  {fmt:40} -> {status}: {info}{'   <-- image read OK' if seen else ''}")
+            if seen and not found:
+                found = fmt
+        if found:
+            break
+    tried = min(len(IMAGE_FORMATS), i + batch)
+    log(f"  ({tried} formats tried; identical FileInputBase64Content errors hidden)")
+
+    if not found:
+        log("\nNo format worked with this model. Testing other models with standard formats...")
+        try:
+            r = await http.get(ABBY_BASE_URL + "/api/v1/models")
+            models = [m["id"] for m in r.json().get("data", []) if m.get("id") != MODEL]
+        except Exception:
+            models = []
+        for model in models[:8]:
+            for fmt in ("openai_url", "openai_file", "anthropic"):
+                f, status, info, seen = await try_fmt(fmt, model=model)
+                log(f"  {model:28} {fmt:12} -> {status}: {info}{'   <-- WORKS' if seen else ''}")
+                if seen:
+                    log(f"\n[TIP] Model {model} accepts images. Set in .env:\n"
+                        f"      ABBY_MODEL={model}\n      ABBY_IMAGE_FORMAT={fmt}")
+                    break
+
+    safe_write_text(log_path, "\n".join(log_lines))
+    if found:
+        log(f"\n[TIP] Add to .env to skip detection next time:  ABBY_IMAGE_FORMAT={found}\n")
+        return found
+    raise RuntimeError(
+        f"Abby rejected every image format for {MODEL}. Full log saved to {log_path}. "
+        "Share that log (or the image example from the Abby API docs)."
     )
 
 
-async def generate(model, image_part, config):
-    contents = [image_part]
+def extract_text(data):
+    """Read the answer text from common response shapes (OpenAI / Abby variants)."""
+    if isinstance(data, dict):
+        choices = data.get("choices")
+        if choices:
+            message = choices[0].get("message") or {}
+            content = message.get("content")
+            if isinstance(content, list):
+                return "".join(part.get("text", "") for part in content if isinstance(part, dict))
+            if content:
+                return content
+            if choices[0].get("text"):
+                return choices[0]["text"]
+        for key in ("output_text", "answer", "response", "content", "text", "message"):
+            value = data.get(key)
+            if isinstance(value, str) and value.strip():
+                return value
+            if isinstance(value, dict):
+                nested = extract_text(value)
+                if nested:
+                    return nested
+    return None
+
+
+def extract_usage(data):
+    usage = (data or {}).get("usage") or {}
+    details = usage.get("completion_tokens_details") or {}
+    return {
+        "input_tokens": usage.get("prompt_tokens", usage.get("input_tokens")),
+        "output_tokens": usage.get("completion_tokens", usage.get("output_tokens")),
+        "thought_tokens": details.get("reasoning_tokens"),
+        "total_tokens": usage.get("total_tokens"),
+    }
+
+
+JSON_BLOCK = re.compile(r"\{.*\}", re.DOTALL)
+
+
+def parse_detections(text):
+    """Tolerant JSON parsing: strips code fences, drops malformed detections."""
+    cleaned = text.strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", cleaned, flags=re.IGNORECASE)
+    try:
+        raw = json.loads(cleaned)
+    except json.JSONDecodeError:
+        match = JSON_BLOCK.search(cleaned)
+        if not match:
+            raise ValueError(f"Abby response is not JSON: {text[:200]!r}")
+        raw = json.loads(match.group(0))
+
+    if isinstance(raw, list):
+        raw = {"detections": raw}
+
+    valid = []
+    for item in raw.get("detections", []) or []:
+        try:
+            valid.append(Detection.model_validate({
+                "k": item.get("k"),
+                "i": item.get("i") or "",
+                "b": [int(round(float(v))) for v in item.get("b", [])],
+            }).model_dump())
+        except Exception:
+            continue
+    return {"detections": valid}
+
+
+async def generate(http, image_b64):
+    """Single Abby request. Returns (text, usage, elapsed)."""
     started = time.perf_counter()
-    ttft = None
-    usage = None
-
-    if USE_STREAM:
-        chunks = []
-        stream = await client.aio.models.generate_content_stream(
-            model=model,
-            contents=contents,
-            config=config,
-        )
-        async for chunk in stream:
-            if ttft is None:
-                ttft = time.perf_counter() - started
-            if chunk.text:
-                chunks.append(chunk.text)
-            if chunk.usage_metadata:
-                usage = chunk.usage_metadata
-        response_text = "".join(chunks)
-    else:
-        response = await client.aio.models.generate_content(
-            model=model,
-            contents=contents,
-            config=config,
-        )
-        response_text = response.text
-        usage = response.usage_metadata
-
-    return response_text, usage, ttft, time.perf_counter() - started
+    response = await http.post(ABBY_ENDPOINT, json=build_payload(image_b64))
+    # Fallback only if the error message itself is about JSON mode.
+    if response.status_code in (400, 422) and JSON_MODE_STATE["enabled"] and USE_JSON_MODE:
+        msg = error_message(response).lower()
+        if "response_format" in msg or "json_object" in msg or "json mode" in msg:
+            JSON_MODE_STATE["enabled"] = False
+            print("[INFO] Model does not accept response_format; continuing without JSON mode.")
+            response = await http.post(ABBY_ENDPOINT, json=build_payload(image_b64))
+    if response.status_code >= 400:
+        raise AbbyHTTPError(response.status_code, error_message(response)[:500])
+    data = response.json()
+    return extract_text(data), extract_usage(data), time.perf_counter() - started
 
 
-async def process_one(name, originals, crop_rects, semaphore, batch_start):
+class AbbyHTTPError(Exception):
+    def __init__(self, status, body):
+        super().__init__(f"HTTP {status}: {body}")
+        self.status = status
+
+
+def is_retryable(exc):
+    if isinstance(exc, AbbyHTTPError):
+        return exc.status in RETRYABLE_STATUS
+    return isinstance(exc, (httpx.TimeoutException, httpx.TransportError))
+
+
+async def process_one(http, name, originals, crop_rects, semaphore, batch_start):
     preprocess_start = time.perf_counter()
     image_bytes, rect, crop_size, sent_size, preprocess_timings = await asyncio.to_thread(
         prepare_image, name, originals, crop_rects
     )
+    image_b64 = base64.b64encode(image_bytes).decode("ascii")
     preprocess_sec = time.perf_counter() - preprocess_start
-    image_part = types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg")
 
     queue_start = time.perf_counter()
     async with semaphore:
@@ -737,59 +1034,44 @@ async def process_one(name, originals, crop_rects, semaphore, batch_start):
         retries = 0
         retry_delay = 0.0
         response_text = None
-        usage = None
-        ttft = None
+        usage = {}
 
         for attempt in range(MAX_RETRIES + 1):
             request_started = time.perf_counter()
             try:
-                response_text, usage, ttft, elapsed = await generate(
-                    MODEL, image_part, make_config()
-                )
+                response_text, usage, _ = await generate(http, image_b64)
                 api_rtt += time.perf_counter() - request_started
                 break
             except Exception as exc:
                 api_rtt += time.perf_counter() - request_started
-                message = str(exc).lower()
-                retryable = any(
-                    token in message
-                    for token in (
-                        "429", "500", "502", "503", "504",
-                        "timeout", "temporarily unavailable",
-                    )
-                )
-                if attempt >= MAX_RETRIES or not retryable:
-                    try:
-                        exc.panelsight_metrics = {
-                            "image": name, "model": MODEL,
-                            "image_load_s": IMAGE_LOAD_METRICS.get(name),
-                            **{key: round(value, 6) for key, value in preprocess_timings.items()},
-                            "preprocess_s": round(preprocess_sec, 6),
-                            "queue_wait_s": round(queue_wait, 6),
-                            "api_rtt_s": round(api_rtt, 6), "retries": retries,
-                            "retry_delay_s": round(retry_delay, 6),
-                            "status": f"ERROR: {type(exc).__name__}: {exc}",
-                        }
-                    except Exception:
-                        pass
+                if attempt >= MAX_RETRIES or not is_retryable(exc):
+                    exc.panelsight_metrics = {
+                        "image": name, "model": MODEL,
+                        "image_load_s": IMAGE_LOAD_METRICS.get(name),
+                        **{key: round(value, 6) for key, value in preprocess_timings.items()},
+                        "preprocess_s": round(preprocess_sec, 6),
+                        "queue_wait_s": round(queue_wait, 6),
+                        "api_rtt_s": round(api_rtt, 6), "retries": retries,
+                        "retry_delay_s": round(retry_delay, 6),
+                        "status": f"ERROR: {type(exc).__name__}: {exc}",
+                    }
                     raise
                 retries += 1
-                delay = 1.5 * (2 ** attempt)
+                delay = min(20.0, 1.5 * (2 ** attempt))
                 retry_delay += delay
+                print(f"[RETRY {retries}] {name}: {exc} -> waiting {delay:.1f}s")
                 await asyncio.sleep(delay)
 
     if not response_text:
-        raise ValueError("Gemini returned no JSON text. Check safety/block status.")
+        raise ValueError("Abby returned no text. Check model name / endpoint / response format.")
 
     parse_started = time.perf_counter()
-    parsed = SCHEMA.model_validate_json(response_text).model_dump()
+    parsed = parse_detections(response_text)
     json_parse_sec = time.perf_counter() - parse_started
     coordinate_started = time.perf_counter()
     image_data = to_image_detections(parsed, name, rect, originals)
     coordinate_sec = time.perf_counter() - coordinate_started
     json_ready = time.perf_counter()
-
-    usage_value = lambda key: getattr(usage, key, None) if usage else None
 
     return {
         "name": name,
@@ -801,17 +1083,13 @@ async def process_one(name, originals, crop_rects, semaphore, batch_start):
             "image_load_s": round(IMAGE_LOAD_METRICS.get(name, 0), 6),
             "api_rtt_s": round(api_rtt, 3),
             "retry_delay_s": round(retry_delay, 6),
-            "ttft_s": None if ttft is None else round(ttft, 3),
             "json_ready_s": round(json_ready - batch_start, 3),
             "preprocess_s": round(preprocess_sec, 3),
             **{key: round(value, 6) for key, value in preprocess_timings.items()},
             "queue_wait_s": round(queue_wait, 3),
             "json_parse_s": round(json_parse_sec, 6),
             "coordinate_s": round(coordinate_sec, 6),
-            "input_tokens": usage_value("prompt_token_count"),
-            "output_tokens": usage_value("candidates_token_count"),
-            "thought_tokens": usage_value("thoughts_token_count"),
-            "total_tokens": usage_value("total_token_count"),
+            **usage,
             "retries": retries,
             "original_size": f"{originals[name].width}x{originals[name].height}",
             "crop_size": f"{crop_size[0]}x{crop_size[1]}",
@@ -825,13 +1103,24 @@ async def run_batch(originals, crop_rects):
     semaphore = asyncio.Semaphore(MAX_CONCURRENCY)
     batch_start = time.perf_counter()
 
-    results = await asyncio.gather(
-        *[
-            process_one(name, originals, crop_rects, semaphore, batch_start)
-            for name in originals
-        ],
-        return_exceptions=True,
-    )
+    # One shared HTTP client = connection reuse (TLS handshake only once).
+    limits = httpx.Limits(max_connections=MAX_CONCURRENCY, max_keepalive_connections=MAX_CONCURRENCY)
+    async with httpx.AsyncClient(
+        headers=auth_headers(),
+        timeout=httpx.Timeout(REQUEST_TIMEOUT_S, connect=15.0),
+        limits=limits,
+        verify=VERIFY_SSL,
+        http2=False,
+    ) as http:
+        if IMAGE_FORMAT_STATE["name"] == "auto":
+            IMAGE_FORMAT_STATE["name"] = await detect_image_format(http)
+        results = await asyncio.gather(
+            *[
+                process_one(http, name, originals, crop_rects, semaphore, batch_start)
+                for name in originals
+            ],
+            return_exceptions=True,
+        )
 
     wall_time = time.perf_counter() - batch_start
     cleaned = []
@@ -916,6 +1205,7 @@ def annotate_original(name, compact, originals):
 def export_results(results, originals, wall_time, crop_ui_sec=0.0):
     all_metrics = []
 
+    OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
     run_dir = OUTPUT_ROOT / time.strftime("run_%Y%m%d_%H%M%S")
     run_dir.mkdir(parents=True, exist_ok=True)
 
@@ -982,9 +1272,9 @@ def export_results(results, originals, wall_time, crop_ui_sec=0.0):
         if not ok_df.empty:
             print(f"Mean API RTT: {ok_df['api_rtt_s'].mean():.2f}s")
             if "input_tokens" in ok_df:
-                print(f"Input tokens: {int(ok_df['input_tokens'].fillna(0).sum())}")
-                print(f"Output tokens: {int(ok_df['output_tokens'].fillna(0).sum())}")
-                print(f"Thought tokens: {int(ok_df['thought_tokens'].fillna(0).sum())}")
+                print(f"Input tokens: {int(pd.to_numeric(ok_df['input_tokens'], errors='coerce').fillna(0).sum())}")
+                print(f"Output tokens: {int(pd.to_numeric(ok_df['output_tokens'], errors='coerce').fillna(0).sum())}")
+                print(f"Thought tokens: {int(pd.to_numeric(ok_df['thought_tokens'], errors='coerce').fillna(0).sum())}")
 
     print("\nMetrics:")
     print(metrics_df.to_string(index=False))
@@ -1024,7 +1314,7 @@ def main():
     crop_rects = select_rois(originals)
     crop_ui_sec = time.perf_counter() - crop_ui_started
 
-    print("\nStarting Gemini processing...")
+    print("\nStarting Abby processing...")
     started = time.perf_counter()
     results, wall_time = asyncio.run(run_batch(originals, crop_rects))
     batch_to_json_sec = time.perf_counter() - started
